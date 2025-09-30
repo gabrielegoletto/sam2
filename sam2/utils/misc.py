@@ -6,6 +6,7 @@
 
 import os
 import warnings
+from functools import lru_cache
 from threading import Thread
 
 import numpy as np
@@ -104,6 +105,7 @@ def _load_img_as_tensor(img_path, image_size):
 class AsyncVideoFrameLoader:
     """
     A list of video frames to be load asynchronously without blocking session start.
+    Uses LRU cache to manage memory by automatically unloading least recently used frames.
     """
 
     def __init__(
@@ -114,19 +116,22 @@ class AsyncVideoFrameLoader:
         img_mean,
         img_std,
         compute_device,
+        max_cached_frames=100,
     ):
         self.img_paths = img_paths
         self.image_size = image_size
         self.offload_video_to_cpu = offload_video_to_cpu
         self.img_mean = img_mean
         self.img_std = img_std
-        # items in `self.images` will be loaded asynchronously
-        self.images = [None] * len(img_paths)
+        self.max_cached_frames = max_cached_frames
         # catch and raise any exceptions in the async loading thread
         self.exception = None
         # video_height and video_width be filled when loading the first image
         self.video_height = None
         self.video_width = None
+
+        # items will be loaded asynchronously and cached by LRU
+        self._load_frame_cached = lru_cache(maxsize=max_cached_frames)(self._load_frame)
         self.compute_device = compute_device
 
         # load the first frame to fill video_height and video_width and also
@@ -136,7 +141,7 @@ class AsyncVideoFrameLoader:
         # load the rest of frames asynchronously without blocking the session start
         def _load_frames():
             try:
-                for n in tqdm(range(len(self.images)), desc="frame loading (JPEG)"):
+                for n in tqdm(range(len(self.img_paths)), desc="frame loading (JPEG)"):
                     self.__getitem__(n)
             except Exception as e:
                 self.exception = e
@@ -144,14 +149,8 @@ class AsyncVideoFrameLoader:
         self.thread = Thread(target=_load_frames, daemon=True)
         self.thread.start()
 
-    def __getitem__(self, index):
-        if self.exception is not None:
-            raise RuntimeError("Failure in frame loading thread") from self.exception
-
-        img = self.images[index]
-        if img is not None:
-            return img
-
+    def _load_frame(self, index):
+        """Load a single frame - this gets cached by LRU"""
         img, video_height, video_width = _load_img_as_tensor(
             self.img_paths[index], self.image_size
         )
@@ -162,11 +161,15 @@ class AsyncVideoFrameLoader:
         img /= self.img_std
         if not self.offload_video_to_cpu:
             img = img.to(self.compute_device, non_blocking=True)
-        self.images[index] = img
         return img
 
+    def __getitem__(self, index):
+        if self.exception is not None:
+            raise RuntimeError("Failure in frame loading thread") from self.exception
+        return self._load_frame_cached(index)
+
     def __len__(self):
-        return len(self.images)
+        return len(self.img_paths)
 
 
 def load_video_frames(
@@ -220,7 +223,7 @@ def load_video_frames_from_jpg_images(
     compute_device=torch.device("cuda"),
 ):
     """
-    Load the video frames from a directory of JPEG files ("<frame_index>.jpg" format).
+    Load the video frames from a directory of JPEG files ("frame_<frame_index>.jpg" format).
 
     The frames are resized to image_size x image_size and are loaded to GPU if
     `offload_video_to_cpu` is `False` and to CPU if `offload_video_to_cpu` is `True`.
@@ -234,7 +237,7 @@ def load_video_frames_from_jpg_images(
             "Only JPEG frames are supported at this moment. For video files, you may use "
             "ffmpeg (https://ffmpeg.org/) to extract frames into a folder of JPEG files, such as \n"
             "```\n"
-            "ffmpeg -i <your_video>.mp4 -q:v 2 -start_number 0 <output_dir>/'%05d.jpg'\n"
+            "ffmpeg -i <your_video>.mp4 -q:v 2 -start_number 0 <output_dir>/frame_%05d.jpg\n"
             "```\n"
             "where `-q:v` generates high-quality JPEG frames and `-start_number 0` asks "
             "ffmpeg to start the JPEG file from 00000.jpg."
@@ -245,7 +248,7 @@ def load_video_frames_from_jpg_images(
         for p in os.listdir(jpg_folder)
         if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
     ]
-    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0].split("_")[-1]))
     num_frames = len(frame_names)
     if num_frames == 0:
         raise RuntimeError(f"no images found in {jpg_folder}")
